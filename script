@@ -1,0 +1,81 @@
+export PATH=$PATH:/lustre/user/liclab/zhaowx/tools
+
+##step1 下载SRA文件
+source activate rna \
+cat SRR_Acc_List.txt | while read id; do (nohup prefetch  ${id} -O /lustre/user/liclab/zhaowx/homework/NSD2/data & );done \
+
+##step2 sra格式转fastq格式,$i会打印出绝对路径
+for i in /lustre/user/liclab/zhaowx/bishe/data/sra/SRR* 
+do 
+echo $i
+nohup fastq-dump --split-3 --skip-technical --clip --gzip $i -O /lustre/user/liclab/zhaowx/bishe/data/fastq &
+done
+
+##step3 fastqc和multiqc质控
+ls *gz | xargs fastqc -t 2
+multiqc ./ 
+
+##step4 用于去除低质量和接头数据
+bin_trim_galore=trim_galore
+dir='/lustre/user/liclab/zhaowx/rnaseq_jmpractice/clean'
+cat config  |while read config
+do
+arr=($config)
+fq1=${arr[1]}
+fq2=${arr[2]}
+nohup $bin_trim_galore -q 25 --phred33 --length 75 -e 0.1 --stringency 3 --paired -o $dir $fq1 $fq2 &
+done
+
+##再次进行fastqc和multiqc质控
+
+##step5 序列比对
+##step5.1 建立hg19_STAR-2.7.3a索引
+nohup /lustre/user/liclab/zhaowx/tools/STAR-2.7.3a/bin/Linux_x86_64/STAR \
+--runThreadN 8 \
+--genomeDir /lustre/user/liclab/zhaowx/reference/hg19/STAR_index/STAR-2.7.3a_index \
+--runMode genomeGenerate \
+--genomeFastaFiles /lustre/user/liclab/publicData/igenomes/Homo_sapiens/UCSC/hg19/Sequence/WholeGenomeFasta/genome.fa \
+--sjdbGTFfile /lustre/user/liclab/publicData/igenomes/Homo_sapiens/UCSC/hg19/Annotation/Genes/genes.gtf \
+--sjdbOverhang 150 &
+
+## step5.2 STAR比对
+##如果输入格式是gz结尾，那么需要加上zcat, 否则会报错.
+##--readFilesIn 所有需要比对的.fa.gz文件整理在一个路径里
+##--outFileNamePrefix指定输出结果的位置，会自动新建一个指定的STAR_result文件夹
+
+nohup STAR --runThreadN 6 \
+--genomeDir /lustre/user/liclab/zhaowx/reference/hg19/STAR_index/STAR-2.7.3a_index \
+--readFilesIn 路径/SRR1039509_1.fastq.gz SRR1039509_2.fastq.gz \
+--readFilesCommand zcat \
+--outSAMtype BAM SortedByCoordinate \
+--outFileNamePrefix ./STAR_result09 &
+## 这个可以用于单个比对,如果同时有多个文件进行比对可以同时进行，最终合并成一个BAM文件，不用写成下面的循环。
+##（整理成R1_1.fastq.gz,R2_1.fastq.gz,R2_1.fastq.gz,R2_1.fastq.gz R1_2.fastq.gz,R2_2.fastq.gz,R3_2.fastq.gz,R4_2.fastq.gz的格式，可以ls出*.gz文件复制到代码行里面加逗号和空格）
+*********************************************************************************************************
+dir='/lustre/user/liclab/zhaowx/RNAseq_workflow/fastq' \
+cat sample | while read sample 
+do
+fq1=${sample}_1.fastq.gz
+fq2=${sample}_2.fastq.gz
+nohup STAR --runThreadN 6 --genomeDir /lustre/user/liclab/zhaowx/reference/hg19/STAR_index/STAR-2.7.3a_index \
+--readFilesIn $dir/$fq1 $fq2 --readFilesCommand zcat --outSAMtype BAM SortedByCoordinate --outFileNamePrefix ./STAR_result/${sample} &
+done
+***********************************************************************************************************
+更多参数，除了上面常用的一些参数外，STAR的可选参数其实非常多.
+输出BAM文件时，STAR还可以对BAM进行一些预处理，"--bamRemoveDuplicatesType"用于去重("UniqueIdentical","UniqueIdenticalNotMulti")
+如果你希望输出信号文件(Wig格式),那么需要额外增加--outWigType参数，如--outWigType wiggle read2, 还可以用--outWigStrand指定是否将两条链合并(Stranded, Unstranded), 默认--outWigNorm RPM，也就是用RPM进行标准化，可以选择None.
+如果你在建立索引或者比对的时候增加了注释信息，那么STAR还能帮你进行基因计数。参数为--quantMode, 分为转录本水平(TranscriptomeSAM)和基因水平(GeneCounts)，在计数的时候还允许指定哪些哪些read不参与计数，"IndelSoftclipSingleend"和"Singleend"
+对于非链特异性RNA-seq，同时为了保证能和Cufflinks兼容，需要添加--outSAMstrandField intronMotif在SAM中增加XS属性，并且建议加上--outFilterIntronMotifs RemoveNoncanonical。如果是链特异性数据，那么就不需要特别的参数，Cufflinks用--library-type声明类型即可）
+##对BAM文件进行质量评估
+nohup samtools flagstat STAR_resultAligned.sortedByCoord.out.bam > STAR_result.flagstat &
+
+##使用HTSeq对reads进行计数以得到表达矩阵
+nohup htseq-count -f bam -r name -s no -a 10 -t exon -i gene_id -m union STAR_resultAligned.sortedByCoord.out.bam /lustre/user/liclab/publicData/igenomes/Homo_sapiens/UCSC/hg19/Annotation/Genes/genes.gtf > counts.txt &
+
+************************************************************************************************************************************
+##多个samples的批处理
+for i in ls *.bam
+do 
+echo i
+nohup htseq-count -f bam -r name -s no -a 10 -t exon -i gene_id -m union STAR_resultAligned.sortedByCoord.out.bam /lustre/user/liclab/publicData/igenomes/Homo_sapiens/UCSC/hg19/Annotation/Genes/genes.gtf > $i.txt &$i.count &
+done
